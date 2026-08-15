@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# GSConnect Android Files Launcher
+# https://github.com/92jackson/GSConnect-Android-Files-Launcher
+#
+# PURPOSE
+#
+# When mounting an Android device via GSConnect, the mount point may become
+# the filesystem root (/), which is inaccessible. This script detects devices
+# connected via GSConnect, attempts to determine the actual exposed storage
+# location (e.g. /storage/emulated/0), and opens it in your file manager.
+#
+# REQUIREMENTS
+#
+#   sudo dnf install gnome-shell-extension-gsconnect \
+#                    nautilus-gsconnect \
+#                    zenity
+#
+# INSTALL
+#
+#   mkdir -p ~/.local/bin
+#   cp android-files ~/.local/bin/android-files
+#   chmod +x ~/.local/bin/android-files
+#
+# GNOME APPLICATION LAUNCHER
+#
+#   ~/.local/share/applications/android-files.desktop
+#
+#   [Desktop Entry]
+#   Type=Application
+#   Name=Android Files
+#   Comment=Browse Android storage via GSConnect
+#   Exec=/home/USERNAME/.local/bin/android-files
+#   Icon=phone
+#   Terminal=false
+#   Categories=Utility;FileManager;
+#
+#   chmod +x ~/.local/share/applications/android-files.desktop
+#   update-desktop-database ~/.local/share/applications
+#
+###############################################################################
+
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+# true  = always show the device chooser
+# false = automatically select the device when only one is connected
+FORCE_CHOOSER=true
+
+
+# Optional per-device storage path overrides.
+#
+# Overrides are keyed by the persistent KDE Connect / GSConnect device ID.
+#
+# To list currently known GSConnect device object paths and IDs:
+#
+#   gdbus call --session \
+#     --dest org.gnome.Shell.Extensions.GSConnect \
+#     --object-path /org/gnome/Shell/Extensions/GSConnect \
+#     --method org.freedesktop.DBus.ObjectManager.GetManagedObjects \
+#     | grep -o "/org/gnome/Shell/Extensions/GSConnect/Device/[A-Za-z0-9_-]*" \
+#     | sort -u
+#
+# The final component of each object path is the device ID.
+#
+# Example:
+#
+#   /org/gnome/Shell/Extensions/GSConnect/Device/2501aaa146d6445bbd556a28f368c569
+#
+# Device-specific override example:
+#
+# declare -A DEVICE_PATH_OVERRIDES=(
+#     ["2501aaa146d6445bbd556a28f368c569"]="/storage/emulated/0"
+#     ["another-device-id"]="/sdcard"
+# )
+#
+declare -A DEVICE_PATH_OVERRIDES=(
+)
+
+
+# Storage paths tested automatically, in order.
+CANDIDATE_PATHS=(
+    "/storage/emulated/0"
+    "/storage/self/primary"
+    "/sdcard"
+    "/mnt/sdcard"
+)
+
+
+# Maximum time allowed for GSConnect/GVFS to establish the SFTP mount.
+# 50 × 0.2 seconds = approximately 10 seconds.
+MOUNT_WAIT_LOOPS=50
+MOUNT_WAIT_INTERVAL=0.2
+
+
+###############################################################################
+# INTERNAL SETTINGS
+###############################################################################
+
+DEST="org.gnome.Shell.Extensions.GSConnect"
+ROOT="/org/gnome/Shell/Extensions/GSConnect"
+
+
+###############################################################################
+# HELPER FUNCTIONS
+###############################################################################
+
+show_error() {
+    local message="$1"
+
+    if command -v zenity >/dev/null 2>&1; then
+        zenity \
+            --error \
+            --title="Android Files" \
+            --text="$message" \
+            --width=400
+    else
+        notify-send "Android Files" "$message"
+    fi
+}
+
+
+###############################################################################
+# CHECK DEPENDENCIES
+###############################################################################
+
+if ! command -v gdbus >/dev/null 2>&1; then
+    show_error "gdbus is not installed."
+    exit 1
+fi
+
+if ! command -v gio >/dev/null 2>&1; then
+    show_error "gio is not installed."
+    exit 1
+fi
+
+if ! command -v zenity >/dev/null 2>&1; then
+    notify-send \
+        "Android Files" \
+        "zenity is required for the graphical device chooser."
+    exit 1
+fi
+
+
+###############################################################################
+# DISCOVER GSConnect DEVICES
+###############################################################################
+
+MANAGED_OBJECTS=$(
+    gdbus call --session \
+        --dest "$DEST" \
+        --object-path "$ROOT" \
+        --method org.freedesktop.DBus.ObjectManager.GetManagedObjects \
+        2>/dev/null
+)
+
+if [[ $? -ne 0 || -z "$MANAGED_OBJECTS" ]]; then
+    show_error "Could not communicate with GSConnect."
+    exit 1
+fi
+
+
+mapfile -t DISCOVERED_PATHS < <(
+    printf '%s\n' "$MANAGED_OBJECTS" |
+    grep -o "/org/gnome/Shell/Extensions/GSConnect/Device/[A-Za-z0-9_-]*" |
+    sort -u
+)
+
+
+declare -a DEVICE_PATHS
+declare -a DEVICE_NAMES
+declare -a DEVICE_IDS
+
+
+###############################################################################
+# FILTER CONNECTED AND PAIRED DEVICES
+###############################################################################
+
+for DEVICE_PATH in "${DISCOVERED_PATHS[@]}"; do
+
+    CONNECTED=$(
+        gdbus call --session \
+            --dest "$DEST" \
+            --object-path "$DEVICE_PATH" \
+            --method org.freedesktop.DBus.Properties.Get \
+            org.gnome.Shell.Extensions.GSConnect.Device \
+            Connected \
+            2>/dev/null
+    )
+
+    [[ "$CONNECTED" != *"true"* ]] && continue
+
+
+    PAIRED=$(
+        gdbus call --session \
+            --dest "$DEST" \
+            --object-path "$DEVICE_PATH" \
+            --method org.freedesktop.DBus.Properties.Get \
+            org.gnome.Shell.Extensions.GSConnect.Device \
+            Paired \
+            2>/dev/null
+    )
+
+    [[ "$PAIRED" != *"true"* ]] && continue
+
+
+    DEVICE_NAME=$(
+        gdbus call --session \
+            --dest "$DEST" \
+            --object-path "$DEVICE_PATH" \
+            --method org.freedesktop.DBus.Properties.Get \
+            org.gnome.Shell.Extensions.GSConnect.Device \
+            Name \
+            2>/dev/null |
+        sed -n "s/.*<'\(.*\)'>.*/\1/p"
+    )
+
+
+    DEVICE_ID=$(
+        gdbus call --session \
+            --dest "$DEST" \
+            --object-path "$DEVICE_PATH" \
+            --method org.freedesktop.DBus.Properties.Get \
+            org.gnome.Shell.Extensions.GSConnect.Device \
+            Id \
+            2>/dev/null |
+        sed -n "s/.*<'\(.*\)'>.*/\1/p"
+    )
+
+
+    [[ -z "$DEVICE_NAME" || -z "$DEVICE_ID" ]] && continue
+
+    DEVICE_PATHS+=("$DEVICE_PATH")
+    DEVICE_NAMES+=("$DEVICE_NAME")
+    DEVICE_IDS+=("$DEVICE_ID")
+done
+
+
+###############################################################################
+# HANDLE NO CONNECTED DEVICES
+###############################################################################
+
+if (( ${#DEVICE_PATHS[@]} == 0 )); then
+    zenity \
+        --warning \
+        --title="Android Files" \
+        --text="No connected and paired GSConnect devices were found." \
+        --width=400
+
+    exit 1
+fi
+
+
+###############################################################################
+# DEVICE SELECTION
+###############################################################################
+
+if [[ "$FORCE_CHOOSER" == true || ${#DEVICE_PATHS[@]} -gt 1 ]]; then
+
+    CHOOSER_DATA=()
+
+    for i in "${!DEVICE_NAMES[@]}"; do
+        CHOOSER_DATA+=(
+            "$i"
+            "${DEVICE_NAMES[$i]}"
+            "${DEVICE_IDS[$i]}"
+        )
+    done
+
+
+    SELECTED_INDEX=$(
+        zenity \
+            --list \
+            --title="Android Files" \
+            --text="Choose a device" \
+            --column="Index" \
+            --column="Device" \
+            --column="Device ID" \
+            --hide-column=1 \
+            --print-column=1 \
+            --height=320 \
+            --width=600 \
+            "${CHOOSER_DATA[@]}"
+    )
+
+    [[ -z "$SELECTED_INDEX" ]] && exit 0
+
+else
+
+    SELECTED_INDEX=0
+
+fi
+
+
+DEVICE_PATH="${DEVICE_PATHS[$SELECTED_INDEX]}"
+DEVICE_NAME="${DEVICE_NAMES[$SELECTED_INDEX]}"
+DEVICE_ID="${DEVICE_IDS[$SELECTED_INDEX]}"
+
+LINK="/run/user/$UID/gsconnect/by-name/$DEVICE_NAME"
+
+
+###############################################################################
+# REQUEST GSConnect SFTP MOUNT
+###############################################################################
+
+MOUNT_REQUIRED=true
+
+if [[ -L "$LINK" ]]; then
+    TARGET=$(readlink "$LINK")
+
+    if [[ -d "$TARGET" ]]; then
+        MOUNT_REQUIRED=false
+    fi
+fi
+
+
+if [[ "$MOUNT_REQUIRED" == true ]]; then
+
+    gdbus call --session \
+        --dest "$DEST" \
+        --object-path "$DEVICE_PATH" \
+        --method org.gtk.Actions.Activate \
+        "mount" \
+        "[]" \
+        "{}" \
+        >/dev/null 2>&1
+
+
+    for ((i=0; i<MOUNT_WAIT_LOOPS; i++)); do
+
+        if [[ -L "$LINK" ]]; then
+            TARGET=$(readlink "$LINK")
+
+            if [[ -d "$TARGET" ]]; then
+                break
+            fi
+        fi
+
+        sleep "$MOUNT_WAIT_INTERVAL"
+
+    done
+fi
+
+
+if [[ ! -L "$LINK" ]]; then
+    show_error "GSConnect could not mount \"$DEVICE_NAME\"."
+    exit 1
+fi
+
+TARGET=$(readlink "$LINK")
+
+if [[ ! -d "$TARGET" ]]; then
+    show_error "The GSConnect mount for \"$DEVICE_NAME\" is not accessible."
+    exit 1
+fi
+
+
+###############################################################################
+# READ CURRENT SFTP CONNECTION
+###############################################################################
+
+TARGET=$(readlink "$LINK")
+TARGET_NAME=$(basename "$TARGET")
+
+HOST=$(
+    sed -n \
+        's/.*host=\([^,]*\),port=.*/\1/p' \
+        <<< "$TARGET_NAME"
+)
+
+PORT=$(
+    sed -n \
+        's/.*port=\([0-9]*\).*/\1/p' \
+        <<< "$TARGET_NAME"
+)
+
+
+if [[ -z "$HOST" || -z "$PORT" ]]; then
+    show_error "Could not determine the SFTP connection for \"$DEVICE_NAME\"."
+    exit 1
+fi
+
+
+###############################################################################
+# DETERMINE ANDROID STORAGE PATH
+###############################################################################
+
+REMOTE_PATH=""
+
+
+# Prefer an explicit per-device override when configured.
+if [[ -n "${DEVICE_PATH_OVERRIDES[$DEVICE_ID]:-}" ]]; then
+
+    OVERRIDE="${DEVICE_PATH_OVERRIDES[$DEVICE_ID]}"
+    OVERRIDE_URI="sftp://${HOST}:${PORT}${OVERRIDE}"
+
+    if gio list "$OVERRIDE_URI" >/dev/null 2>&1; then
+        REMOTE_PATH="$OVERRIDE"
+    else
+        show_error \
+            "The configured storage path for \"$DEVICE_NAME\" is not accessible:
+
+$OVERRIDE"
+
+        exit 1
+    fi
+
+fi
+
+
+# Probe common Android storage locations when no override is configured.
+if [[ -z "$REMOTE_PATH" ]]; then
+
+    for PATH_CANDIDATE in "${CANDIDATE_PATHS[@]}"; do
+
+        URI="sftp://${HOST}:${PORT}${PATH_CANDIDATE}"
+
+        if gio list "$URI" >/dev/null 2>&1; then
+            REMOTE_PATH="$PATH_CANDIDATE"
+            break
+        fi
+
+    done
+fi
+
+
+###############################################################################
+# HANDLE UNKNOWN STORAGE PATH
+###############################################################################
+
+if [[ -z "$REMOTE_PATH" ]]; then
+
+    show_error \
+        "Could not find an accessible storage location on \"$DEVICE_NAME\".
+
+Add a device-specific path to DEVICE_PATH_OVERRIDES.
+
+Device ID:
+$DEVICE_ID"
+
+    exit 1
+
+fi
+
+
+###############################################################################
+# OPEN STORAGE
+###############################################################################
+
+gio open "sftp://${HOST}:${PORT}${REMOTE_PATH}"
