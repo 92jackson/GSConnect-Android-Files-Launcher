@@ -73,7 +73,7 @@ FORCE_CHOOSER=true
 # Device-specific override example:
 #
 # declare -A DEVICE_PATH_OVERRIDES=(
-#     ["2501aaa146d6445bbd556a28f368c569"]="/storage/emulated/0"
+#     ["0123456789abcdef0123456789abcdef"]="/storage/emulated/0"
 #     ["another-device-id"]="/sdcard"
 # )
 #
