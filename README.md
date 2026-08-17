@@ -14,7 +14,7 @@ The script:
 
 ## Requirements
 
-Install GSConnect, Nautilus integration and Zenity on Fedora:
+Install GSConnect, Nautilus integration and Zenity, if using Fedora, use:
 
     sudo dnf install gnome-shell-extension-gsconnect nautilus-gsconnect zenity
 
