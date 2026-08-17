@@ -51,7 +51,7 @@
 FORCE_CHOOSER=true
 
 
-# Optional per-device storage path overrides.
+# OPTIONAL per-device storage path overrides.
 #
 # Overrides are keyed by the persistent KDE Connect / GSConnect device ID.
 #
@@ -68,7 +68,7 @@ FORCE_CHOOSER=true
 #
 # Example:
 #
-#   /org/gnome/Shell/Extensions/GSConnect/Device/2501aaa146d6445bbd556a28f368c569
+#   /org/gnome/Shell/Extensions/GSConnect/Device/0123456789abcdef0123456789abcdef
 #
 # Device-specific override example:
 #
